@@ -3,11 +3,11 @@ from tkinter import messagebox
 import os
 import base64 # Needed for encoding/decoding salt/iv for storage
 import json # For simple storage of master password hash and entries
-import sqlite3
 import random # For password generation
 import string # For password generation
 import time # For clipboard auto-clear
 
+# Import the encryption functions from your new file
 from encryption_utils import derive_key, encrypt, decrypt
 
 class PasswordManagerApp:
@@ -29,8 +29,7 @@ class PasswordManagerApp:
         # Stores {'site': '', 'username': '', 'password_enc': {'ciphertext': '', 'salt': '', 'iv': ''}}
         self.vault_entries = []
         self.current_master_key = None # Will store the derived key after successful login
-        self._connect_db()
-        
+
         # Initialize all screens in the same window but hidden
         self.login_screen()
         self.dashboard_screen()
@@ -40,30 +39,6 @@ class PasswordManagerApp:
 
         # Show login screen at start
         self.show_screen("login")
-
-    def _connect_db(self):
-        """Connects to the SQLite database and creates the entries table if it doesn't exist."""
-        self.conn = sqlite3.connect('vault.db')  # Connect to or create vault.db
-        self.cursor = self.conn.cursor()
-
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                site TEXT NOT NULL,
-                username TEXT NOT NULL,
-                ciphertext TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                iv TEXT NOT NULL
-            )
-        ''')
-        self.conn.commit()
-        print("DEBUG: Database connected and table 'entries' ensured.")
-
-    def _close_db(self):
-        """Closes the database connection."""
-        if hasattr(self, 'conn') and self.conn:
-            self.conn.close()
-            print("DEBUG: Database connection closed.")
 
     def _load_master_password_data(self):
         """
@@ -118,9 +93,6 @@ class PasswordManagerApp:
         """Displays the specified screen."""
         self.hide_all()
         if screen_name == "login":
-            # Re-create login screen to update buttons based on master_password_data state
-            self.login_frame.destroy() # Destroy previous frame
-            self.login_screen() # Re-create with current state
             self.login_frame.pack(fill="both", expand=1)
         elif screen_name == "dashboard":
             self.dashboard_frame.pack(fill="both", expand=1)
@@ -129,11 +101,8 @@ class PasswordManagerApp:
         elif screen_name == "generate_password":
             self.generate_password_frame.pack(fill="both", expand=1)
         elif screen_name == "view_entries":
-            self.update_view_entries_list()
+            self.update_view_entries_list() # Refresh list when showing
             self.view_entries_frame.pack(fill="both", expand=1)
-
-        self.root.update_idletasks()
-        self.root.update()
 
     # --- Login Screen ---
     def login_screen(self):
