@@ -109,6 +109,32 @@ class PasswordManagerApp:
             json.dump(data, f)
         self.master_password_data = data # Update in-memory copy
 
+    def _load_vault_entries_from_db(self):
+        """Loads encrypted vault entries from the database into memory."""
+        self.vault_entries = [] # Clear current in-memory list
+        try:
+            self.cursor.execute('SELECT site, username, ciphertext, salt, iv FROM entries')
+            rows = self.cursor.fetchall()
+            for row in rows:
+                site, username, ciphertext, salt, iv = row
+                self.vault_entries.append({
+                    'site': site,
+                    'username': username,
+                    'password_enc': {
+                        'ciphertext': ciphertext,
+                        'salt': salt,
+                        'iv': iv
+                    }
+                })
+            print(f"DEBUG: Loaded {len(self.vault_entries)} entries from database.")
+        except sqlite3.Error as e:
+            messagebox.showerror("Database Error", f"Failed to load entries from database: {e}")
+            print(f"ERROR: Database load error: {e}")
+
+    def on_closing(self): 
+        self._close_db()
+        self.root.destroy()
+
     def hide_all(self):
         """Hides all frames in the root window."""
         for widget in self.root.winfo_children():
