@@ -6,10 +6,11 @@ import json
 import sqlite3
 import random
 import string
+# import time # Not used, can be removed
 
 from encryption_utils import derive_key, encrypt, decrypt # Ensure encryption_utils.py is in the same folder!
 
-class PasswordManagerApp:
+class EncryptedPasswordManagerApp: 
     def __init__(self, root):
         self.root = root
         self.root.title("Encrypted Password Manager")
@@ -55,7 +56,7 @@ class PasswordManagerApp:
             self.conn.close()
 
     def _load_master_password_data(self):
-        """Loads master password hash and salt from 'master_pass.json' for persistence."""
+        """Loads master password hash and salt from 'master_pass.json'."""
         if os.path.exists(self.master_password_hash_file):
             try:
                 with open(self.master_password_hash_file, 'r') as f:
@@ -260,7 +261,6 @@ class PasswordManagerApp:
             ''', (site, username, encrypted_data['ciphertext'], encrypted_data['salt'], encrypted_data['iv']))
             self.conn.commit()
 
-            # Append to in-memory list AFTER successful database save
             self.vault_entries.append({
                 'site': site,
                 'username': username,
@@ -268,7 +268,6 @@ class PasswordManagerApp:
             })
 
             messagebox.showinfo("Saved", f"Entry for '{site}' saved successfully!")
-            # Clear input fields
             self.site_entry.delete(0, tk.END)
             self.username_entry.delete(0, tk.END)
             self.password_entry.delete(0, tk.END)
@@ -303,7 +302,7 @@ class PasswordManagerApp:
             self.root.clipboard_clear()
             self.root.clipboard_append(generated_pass)
             messagebox.showinfo("Copied", "Generated password copied to clipboard. It will clear in 30 seconds.")
-            self.root.after(30000, self.root.clipboard_clear) # Schedule clipboard to clear after 30 seconds
+            self.root.after(30000, self.root.clipboard_clear)
         else:
             messagebox.showwarning("Warning", "No password generated to copy.")
 
@@ -323,7 +322,7 @@ class PasswordManagerApp:
         scrollbar.pack(side="right", fill="y")
         self.entry_listbox.config(yscrollcommand=scrollbar.set)
 
-        self.entry_listbox.bind("<<ListboxSelect>>", self.on_entry_select) # Bind selection event
+        self.entry_listbox.bind("<<ListboxSelect>>", self.on_entry_select)
 
         detail_frame = tk.Frame(self.view_entries_frame)
         detail_frame.pack(pady=10)
@@ -438,7 +437,7 @@ class PasswordManagerApp:
             self.root.clipboard_clear()
             self.root.clipboard_append(decrypted_pass)
             messagebox.showinfo("Copied", "Password copied to clipboard. It will clear in 30 seconds.")
-            self.root.after(30000, self.root.clipboard_clear) # Schedule clipboard to clear after 30 seconds
+            self.root.after(30000, self.root.clipboard_clear)
         except Exception as e:
             messagebox.showerror("Copy Error", f"Failed to copy password: {e}")
 
@@ -475,5 +474,5 @@ class PasswordManagerApp:
 # Run the application
 if __name__ == "__main__":
     root = tk.Tk()
-    app = PasswordManagerApp(root)
+    app = EncryptedPasswordManagerApp(root) 
     root.mainloop()
