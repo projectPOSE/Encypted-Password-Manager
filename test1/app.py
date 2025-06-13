@@ -6,11 +6,10 @@ import json
 import sqlite3
 import random
 import string
-# import time # Not used, can be removed
 
 from encryption_utils import derive_key, encrypt, decrypt # Ensure encryption_utils.py is in the same folder!
 
-class EncryptedPasswordManagerApp: 
+class EncryptedPasswordManagerApp: # Renamed class
     def __init__(self, root):
         self.root = root
         self.root.title("Encrypted Password Manager")
@@ -21,6 +20,7 @@ class EncryptedPasswordManagerApp:
 
         self.vault_entries = []
         self.current_master_key = None # Stores the derived key after successful login
+        self.editing_entry_index = -1 # NEW: -1 for adding new, index for editing existing
 
         self._connect_db()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing) # Handles graceful shutdown
@@ -56,7 +56,7 @@ class EncryptedPasswordManagerApp:
             self.conn.close()
 
     def _load_master_password_data(self):
-        """Loads master password hash and salt from 'master_pass.json'."""
+        """Loads master password hash and salt from 'master_pass.json' for persistence."""
         if os.path.exists(self.master_password_hash_file):
             try:
                 with open(self.master_password_hash_file, 'r') as f:
@@ -83,11 +83,12 @@ class EncryptedPasswordManagerApp:
         """Loads encrypted vault entries from the SQLite database into memory."""
         self.vault_entries = [] # Clear current in-memory list
         try:
-            self.cursor.execute('SELECT site, username, ciphertext, salt, iv FROM entries')
+            self.cursor.execute('SELECT id, site, username, ciphertext, salt, iv FROM entries') # Select id too!
             rows = self.cursor.fetchall()
             for row in rows:
-                site, username, ciphertext, salt, iv = row
+                db_id, site, username, ciphertext, salt, iv = row # Unpack id
                 self.vault_entries.append({
+                    'id': db_id, # Store database ID
                     'site': site,
                     'username': username,
                     'password_enc': {
@@ -119,6 +120,9 @@ class EncryptedPasswordManagerApp:
         elif screen_name == "dashboard":
             self.dashboard_frame.pack(fill="both", expand=1)
         elif screen_name == "add_entry":
+            # Re-create add_entry_screen to update its title dynamically
+            self.add_entry_frame.destroy()
+            self.add_entry_screen()
             self.add_entry_frame.pack(fill="both", expand=1)
         elif screen_name == "generate_password":
             self.generate_password_frame.pack(fill="both", expand=1)
@@ -200,17 +204,21 @@ class EncryptedPasswordManagerApp:
         tk.Button(self.dashboard_frame, text="Logout", width=30, command=self.logout, font=("Arial", 12)).pack(pady=20)
 
     def logout(self):
-        """Logs out the user, clearing the master key from memory."""
+        """Logs out the user, clearing the master key and vault entries from memory."""
         self.current_master_key = None
-        self.vault_entries = [] # Clear entries from memory
+        self.vault_entries = []
+        self.editing_entry_index = -1 # Reset editing state on logout
         messagebox.showinfo("Logout", "Logged out successfully.")
         self.show_screen("login")
 
-    # --- Add New Entry Screen ---
+    # --- Add New Entry / Edit Entry Screen ---
     def add_entry_screen(self):
-        """Sets up the screen for adding new password entries."""
+        """Sets up the screen for adding new or editing existing password entries."""
         self.add_entry_frame = tk.Frame(self.root)
-        tk.Label(self.add_entry_frame, text="Add New Entry", font=("Arial", 16, "bold")).pack(pady=10)
+        
+        # Dynamic Title for Add/Edit
+        title_text = "Edit Entry" if self.editing_entry_index != -1 else "Add New Entry"
+        tk.Label(self.add_entry_frame, text=title_text, font=("Arial", 16, "bold")).pack(pady=10)
 
         tk.Label(self.add_entry_frame, text="Site Name:", font=("Arial", 10)).pack(anchor="w", padx=10, pady=(10,0))
         self.site_entry = tk.Entry(self.add_entry_frame, width=40, font=("Arial", 10))
@@ -231,6 +239,24 @@ class EncryptedPasswordManagerApp:
 
         tk.Button(self.add_entry_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 10)).pack(pady=10)
 
+        # Pre-populate fields if in edit mode
+        if self.editing_entry_index != -1:
+            try:
+                entry = self.vault_entries[self.editing_entry_index]
+                self.site_entry.insert(0, entry['site'])
+                self.username_entry.insert(0, entry['username'])
+                # Decrypt and display password for editing
+                decrypted_pass = decrypt(
+                    entry['password_enc']['ciphertext'],
+                    self.current_master_key.decode('latin-1'),
+                    entry['password_enc']['salt'],
+                    entry['password_enc']['iv']
+                )
+                self.password_entry.insert(0, decrypted_pass)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not load entry for editing: {e}")
+                self.editing_entry_index = -1 # Reset if error
+
     def generate_password_for_add(self):
         """Generates a random password and inserts it into the password entry field."""
         length = 12
@@ -240,7 +266,7 @@ class EncryptedPasswordManagerApp:
         self.password_entry.insert(0, new_pass)
 
     def save_entry(self):
-        """Encrypts and saves a new password entry to the SQLite database and in-memory storage."""
+        """Encrypts and saves a new password entry or updates an existing one."""
         site = self.site_entry.get().strip()
         username = self.username_entry.get().strip()
         plaintext_password = self.password_entry.get()
@@ -255,22 +281,48 @@ class EncryptedPasswordManagerApp:
         try:
             encrypted_data = encrypt(plaintext_password, self.current_master_key.decode('latin-1'))
 
-            self.cursor.execute('''
-                INSERT INTO entries (site, username, ciphertext, salt, iv)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (site, username, encrypted_data['ciphertext'], encrypted_data['salt'], encrypted_data['iv']))
-            self.conn.commit()
+            if self.editing_entry_index != -1: # It's an edit operation
+                original_entry = self.vault_entries[self.editing_entry_index]
+                entry_id = original_entry['id'] # Use the database ID for update
 
-            self.vault_entries.append({
-                'site': site,
-                'username': username,
-                'password_enc': encrypted_data
-            })
+                self.cursor.execute('''
+                    UPDATE entries
+                    SET site = ?, username = ?, ciphertext = ?, salt = ?, iv = ?
+                    WHERE id = ?
+                ''', (site, username, encrypted_data['ciphertext'],
+                      encrypted_data['salt'], encrypted_data['iv'], entry_id))
+                self.conn.commit()
 
-            messagebox.showinfo("Saved", f"Entry for '{site}' saved successfully!")
+                # Update the in-memory list
+                original_entry.update({
+                    'site': site,
+                    'username': username,
+                    'password_enc': encrypted_data
+                })
+                messagebox.showinfo("Saved", f"Entry for '{site}' updated successfully!")
+
+            else: # It's a new entry operation
+                self.cursor.execute('''
+                    INSERT INTO entries (site, username, ciphertext, salt, iv)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (site, username, encrypted_data['ciphertext'], encrypted_data['salt'], encrypted_data['iv']))
+                self.conn.commit()
+                
+                # Retrieve the last inserted ID for the new entry to store in memory
+                new_id = self.cursor.lastrowid
+                self.vault_entries.append({
+                    'id': new_id, # Store database ID
+                    'site': site,
+                    'username': username,
+                    'password_enc': encrypted_data
+                })
+                messagebox.showinfo("Saved", f"Entry for '{site}' saved successfully!")
+
+            # Clear input fields and reset editing state
             self.site_entry.delete(0, tk.END)
             self.username_entry.delete(0, tk.END)
             self.password_entry.delete(0, tk.END)
+            self.editing_entry_index = -1 # Reset to add mode
 
         except Exception as e:
             messagebox.showerror("Encryption/Database Error", f"Failed to save entry: {e}")
@@ -336,11 +388,27 @@ class EncryptedPasswordManagerApp:
         tk.Button(action_buttons_frame, text="Toggle Password Visibility", command=self.toggle_password_visibility, font=("Arial", 10)).pack(side="left", padx=5)
         tk.Button(action_buttons_frame, text="Copy Password", command=self.copy_password, font=("Arial", 10)).pack(side="left", padx=5)
         tk.Button(action_buttons_frame, text="Delete Selected", command=self.delete_selected_entry, font=("Arial", 10)).pack(side="left", padx=5)
+        tk.Button(action_buttons_frame, text="Edit Selected", command=self.edit_selected_entry, font=("Arial", 10)).pack(side="left", padx=5) # NEW EDIT BUTTON
 
         tk.Button(self.view_entries_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 12)).pack(pady=20)
 
         self.current_selected_index = -1
         self.password_visible_for_index = -1 # Track which password is currently visible
+
+    # NEW: Edit Selected Entry Method
+    def edit_selected_entry(self):
+        """Prepares the add_entry_screen for editing the selected entry."""
+        if self.current_selected_index == -1:
+            messagebox.showwarning("Warning", "Please select an entry to edit.")
+            return
+
+        # Set the flag for editing
+        self.editing_entry_index = self.current_selected_index
+        
+        # Now switch to the add_entry_screen, which will detect editing_entry_index
+        # and pre-populate fields.
+        self.show_screen("add_entry")
+
 
     def update_view_entries_list(self):
         """Clears and repopulates the listbox with current vault entries."""
@@ -371,6 +439,7 @@ class EncryptedPasswordManagerApp:
 
         self.current_selected_index = selected_indices[0]
         self.password_visible_for_index = -1 # Reset visibility when a new entry is selected
+        self.editing_entry_index = -1 # NEW: Ensure editing state is reset when a new entry is selected in the list
         self.display_entry_details(self.current_selected_index)
 
     def display_entry_details(self, index):
@@ -449,17 +518,14 @@ class EncryptedPasswordManagerApp:
 
         if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this entry?"):
             entry_to_delete = self.vault_entries[self.current_selected_index]
-            site_to_delete = entry_to_delete['site']
-            username_to_delete = entry_to_delete['username']
-            ciphertext_to_delete = entry_to_delete['password_enc']['ciphertext']
+            # Use the database ID for deletion for robustness
+            entry_id_to_delete = entry_to_delete['id']
 
             try:
-                self.cursor.execute('''
-                    DELETE FROM entries
-                    WHERE site = ? AND username = ? AND ciphertext = ?
-                ''', (site_to_delete, username_to_delete, ciphertext_to_delete))
+                self.cursor.execute('DELETE FROM entries WHERE id = ?', (entry_id_to_delete,))
                 self.conn.commit()
 
+                # Remove from in-memory list using the index
                 del self.vault_entries[self.current_selected_index]
                 messagebox.showinfo("Deleted", "Entry deleted successfully.")
                 self.update_view_entries_list()
