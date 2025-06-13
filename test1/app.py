@@ -30,6 +30,7 @@ class PasswordManagerApp:
         self.vault_entries = []
         self.current_master_key = None # Will store the derived key after successful login
         self._connect_db()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Initialize all screens in the same window but hidden
         self.login_screen()
@@ -131,9 +132,11 @@ class PasswordManagerApp:
             messagebox.showerror("Database Error", f"Failed to load entries from database: {e}")
             print(f"ERROR: Database load error: {e}")
 
-    def on_closing(self): 
-        self._close_db()
-        self.root.destroy()
+    def on_closing(self):
+        """Handles graceful shutdown when the window is closed."""
+        print("DEBUG: Application closing. Attempting to close database connection.")
+        self._close_db() # Call the method to close the DB connection
+        self.root.destroy() # Destroy the Tkinter root window
 
     def hide_all(self):
         """Hides all frames in the root window."""
@@ -199,6 +202,7 @@ class PasswordManagerApp:
 
         messagebox.showinfo("Success", "Master Password set successfully! You are now logged in.")
         self.entry_password.delete(0, tk.END) # Clear password field
+        self._load_vault_entries_from_db()
         self.show_screen("dashboard")
 
     def check_login(self):
@@ -222,6 +226,7 @@ class PasswordManagerApp:
         if derived_key_for_check == stored_hashed_password:
             self.current_master_key = derived_key_for_check # Store for current session's encryption/decryption
             messagebox.showinfo("Success", "Login successful!")
+            self._load_vault_entries_from_db()
             self.show_screen("dashboard")
             self.entry_password.delete(0, tk.END) # Clear password field
         else:
@@ -281,7 +286,7 @@ class PasswordManagerApp:
         self.password_entry.insert(0, new_pass)
 
     def save_entry(self):
-        """Encrypts and saves a new password entry to in-memory storage."""
+        """Encrypts and saves a new password entry to in-memory storage AND to the SQLite database."""
         site = self.site_entry.get().strip()
         username = self.username_entry.get().strip()
         plaintext_password = self.password_entry.get() # This is the plaintext password
@@ -295,23 +300,37 @@ class PasswordManagerApp:
 
         try:
             # ENCRYPT THE PLAINTEXT PASSWORD BEFORE STORING
-            # We use the 'encrypt' function from encryption_utils
-            # The encrypt function needs the master key as a string (decoded from bytes)
             encrypted_data = encrypt(plaintext_password, self.current_master_key.decode('latin-1')) # Using latin-1 for byte->str conversion
 
-            # Store the encrypted parts along with site and username
+            # --- CRITICAL FIX START ---
+            # 1. Correct SQL INSERT statement
+            # 2. Correct parameter passing using '?' placeholders
+            # 3. Move self.conn.commit() here
+            self.cursor.execute('''
+                INSERT INTO entries (site, username, ciphertext, salt, iv)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (site, username, encrypted_data['ciphertext'], encrypted_data['salt'], encrypted_data['iv']))
+            self.conn.commit() # <--- COMMIT HERE after successful insert
+            print(f"DEBUG: Entry for '{site}' saved to database.") # Confirm in terminal
+
+            # 4. Append to in-memory list AFTER successful database save
             self.vault_entries.append({
                 'site': site,
                 'username': username,
-                'password_enc': encrypted_data
+                'password_enc': encrypted_data # Store the encrypted parts as a dictionary
             })
+            # --- CRITICAL FIX END ---
+
             messagebox.showinfo("Saved", f"Entry for '{site}' saved successfully!")
             # Clear input fields
             self.site_entry.delete(0, tk.END)
             self.username_entry.delete(0, tk.END)
             self.password_entry.delete(0, tk.END)
+
         except Exception as e:
-            messagebox.showerror("Encryption Error", f"Failed to encrypt password: {e}")
+            messagebox.showerror("Encryption/Database Error", f"Failed to save entry: {e}")
+            print(f"ERROR: Save entry error details: {e}")
+            self.conn.rollback() # <--- ROLLBACK HERE if an error occurs during the transaction
 
     # --- Password Generator Screen (UI05) ---
     def generate_password_screen(self):
@@ -485,18 +504,38 @@ class PasswordManagerApp:
             messagebox.showerror("Copy Error", f"Failed to copy password: {e}")
 
     def delete_selected_entry(self):
-        """Deletes the selected entry from the in-memory vault."""
         if self.current_selected_index == -1:
             messagebox.showwarning("Warning", "Please select an entry to delete.")
             return
 
-        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this entry? This action cannot be undone."):
-            del self.vault_entries[self.current_selected_index]
-            messagebox.showinfo("Deleted", "Entry deleted successfully.")
-            self.update_view_entries_list() # Refresh the list after deletion
-            self.detail_label.config(text="Select an entry to view details.") # Reset detail view
-            self.current_selected_index = -1
-            self.password_visible_for_index = -1
+        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this entry?"):
+            entry_to_delete = self.vault_entries[self.current_selected_index]
+            site_to_delete = entry_to_delete['site']
+            username_to_delete = entry_to_delete['username']
+            # We can also use ciphertext for a more robust WHERE clause if needed,
+            # but site and username are usually unique enough for this demo.
+            ciphertext_to_delete = entry_to_delete['password_enc']['ciphertext'] # Added for robustness
+
+            try:
+                # --- ADD THIS DATABASE DELETE OPERATION ---
+                self.cursor.execute('''
+                    DELETE FROM entries
+                    WHERE site = ? AND username = ? AND ciphertext = ?
+                ''', (site_to_delete, username_to_delete, ciphertext_to_delete))
+                self.conn.commit() # <--- COMMIT THE DELETION TO THE DATABASE FILE
+                print(f"DEBUG: Entry for '{site_to_delete}' deleted from database.") # Check your terminal
+
+                # Only delete from in-memory list if database deletion was successful
+                del self.vault_entries[self.current_selected_index]
+                messagebox.showinfo("Deleted", "Entry deleted successfully.")
+                self.update_view_entries_list() # Refresh the list display
+                self.detail_label.config(text="Select an entry to view details.")
+                self.current_selected_index = -1
+                self.password_visible_for_index = -1
+            except sqlite3.Error as e:
+                messagebox.showerror("Database Error", f"Failed to delete entry from database: {e}")
+                print(f"ERROR: Database delete error: {e}")
+                self.conn.rollback() # <--- ROLLBACK if an error occurs
 
 
 # Run the application
