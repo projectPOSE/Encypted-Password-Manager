@@ -7,23 +7,26 @@ import sqlite3
 import random
 import string
 
-from encryption_utils import derive_key, encrypt, decrypt # Ensure encryption_utils.py is in the same folder!
+# Ensure encryption_utils.py is in the same folder!
+# It should contain the updated functions for the Vault Key architecture.
+from encryption_utils import derive_key, encrypt_vault_key, decrypt_vault_key, encrypt_entry, decrypt_entry
 
-class EncryptedPasswordManagerApp: # Renamed class
+class EncryptedPasswordManagerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Encrypted Password Manager")
-        self.root.geometry("600x450") # Increased size for better layout
+        self.root.geometry("600x450")
 
         self.master_password_hash_file = "master_pass.json"
         self.master_password_data = self._load_master_password_data()
 
         self.vault_entries = []
-        self.current_master_key = None # Stores the derived key after successful login
-        self.editing_entry_index = -1 # NEW: -1 for adding new, index for editing existing
+        self.vault_key = None # Stores the decrypted Vault Key (VK) after successful login
+        self._mp_derived_key_temp = None # Temporarily stores the Master Password Derived Key (MPDK) during login/change flows
+        self.editing_entry_index = -1
 
         self._connect_db()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing) # Handles graceful shutdown
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # Initialize all screens (frames)
         self.login_screen()
@@ -31,8 +34,9 @@ class EncryptedPasswordManagerApp: # Renamed class
         self.add_entry_screen()
         self.generate_password_screen()
         self.view_entries_screen()
+        self.change_master_password_screen()
 
-        self.show_screen("login") # Show login screen at start
+        self.show_screen("login")
 
     def _connect_db(self):
         """Connects to the SQLite database and creates the 'entries' table if it doesn't exist."""
@@ -56,39 +60,51 @@ class EncryptedPasswordManagerApp: # Renamed class
             self.conn.close()
 
     def _load_master_password_data(self):
-        """Loads master password hash and salt from 'master_pass.json' for persistence."""
+        """Loads master password hash, salt, and encrypted vault key from 'master_pass.json'."""
         if os.path.exists(self.master_password_hash_file):
             try:
                 with open(self.master_password_hash_file, 'r') as f:
                     data = json.load(f)
                     data['hashed_password'] = base64.b64decode(data['hashed_password'])
                     data['salt'] = base64.b64decode(data['salt'])
+                    data['encrypted_vault_key'] = base64.b64decode(data['encrypted_vault_key'])
+                    data['vk_iv'] = base64.b64decode(data['vk_iv'])
                     return data
             except (json.JSONDecodeError, KeyError) as e:
                 messagebox.showerror("Error", f"Master password file corrupted. Please delete 'master_pass.json' and restart. Error: {e}")
                 return None
         return None
 
-    def _save_master_password_data(self, hashed_password_bytes, salt_bytes):
-        """Saves master password hash and salt to 'master_pass.json'."""
+    def _save_master_password_data(self, hashed_password_bytes, salt_bytes, encrypted_vk_bytes, vk_iv_bytes):
+        """Saves master password hash, salt, and encrypted vault key to 'master_pass.json'."""
         data = {
             'hashed_password': base64.b64encode(hashed_password_bytes).decode('utf-8'),
-            'salt': base64.b64encode(salt_bytes).decode('utf-8')
+            'salt': base64.b64encode(salt_bytes).decode('utf-8'),
+            'encrypted_vault_key': base64.b64encode(encrypted_vk_bytes).decode('utf-8'),
+            'vk_iv': base64.b64encode(vk_iv_bytes).decode('utf-8')
         }
         with open(self.master_password_hash_file, 'w') as f:
             json.dump(data, f)
-        self.master_password_data = data # Update in-memory copy
+        self.master_password_data = {
+            'hashed_password': hashed_password_bytes,
+            'salt': salt_bytes,
+            'encrypted_vault_key': encrypted_vk_bytes,
+            'vk_iv': vk_iv_bytes
+        }
 
     def _load_vault_entries_from_db(self):
         """Loads encrypted vault entries from the SQLite database into memory."""
-        self.vault_entries = [] # Clear current in-memory list
+        self.vault_entries = []
+        if not self.vault_key: # Ensure vault key is available before attempting decryption
+            return
+
         try:
-            self.cursor.execute('SELECT id, site, username, ciphertext, salt, iv FROM entries') # Select id too!
+            self.cursor.execute('SELECT id, site, username, ciphertext, salt, iv FROM entries')
             rows = self.cursor.fetchall()
             for row in rows:
-                db_id, site, username, ciphertext, salt, iv = row # Unpack id
+                db_id, site, username, ciphertext, salt, iv = row
                 self.vault_entries.append({
-                    'id': db_id, # Store database ID
+                    'id': db_id,
                     'site': site,
                     'username': username,
                     'password_enc': {
@@ -114,13 +130,12 @@ class EncryptedPasswordManagerApp: # Renamed class
         """Displays the specified screen and updates the UI."""
         self.hide_all()
         if screen_name == "login":
-            self.login_frame.destroy() # Destroy previous frame
-            self.login_screen() # Re-create with current state
+            self.login_frame.destroy()
+            self.login_screen()
             self.login_frame.pack(fill="both", expand=1)
         elif screen_name == "dashboard":
             self.dashboard_frame.pack(fill="both", expand=1)
         elif screen_name == "add_entry":
-            # Re-create add_entry_screen to update its title dynamically
             self.add_entry_frame.destroy()
             self.add_entry_screen()
             self.add_entry_frame.pack(fill="both", expand=1)
@@ -129,6 +144,10 @@ class EncryptedPasswordManagerApp: # Renamed class
         elif screen_name == "view_entries":
             self.update_view_entries_list()
             self.view_entries_frame.pack(fill="both", expand=1)
+        elif screen_name == "change_master_password":
+            self.change_master_password_frame.destroy()
+            self.change_master_password_screen()
+            self.change_master_password_frame.pack(fill="both", expand=1)
 
         self.root.update_idletasks()
         self.root.update()
@@ -157,15 +176,23 @@ class EncryptedPasswordManagerApp: # Renamed class
             messagebox.showwarning("Warning", "Master Password cannot be empty.")
             return
 
-        salt = os.urandom(16)
-        derived_key_bytes = derive_key(master_pass, salt)
+        mp_salt = os.urandom(16)
+        mp_derived_key = derive_key(master_pass, mp_salt)
 
-        self._save_master_password_data(derived_key_bytes, salt)
-        self.current_master_key = derived_key_bytes
+        vault_key = os.urandom(32) # Generate a new 32-byte Vault Key (VK)
+        encrypted_vk_data = encrypt_vault_key(vault_key, mp_derived_key)
 
-        messagebox.showinfo("Success", "Master Password set successfully! You are now logged in.")
+        self._save_master_password_data(
+            hashed_password_bytes=mp_derived_key,
+            salt_bytes=mp_salt,
+            encrypted_vk_bytes=base64.b64decode(encrypted_vk_data['ciphertext']),
+            vk_iv_bytes=base64.b64decode(encrypted_vk_data['iv'])
+        )
+        self.vault_key = vault_key
+        self._mp_derived_key_temp = mp_derived_key
+
         self.entry_password.delete(0, tk.END)
-        self._load_vault_entries_from_db() # Load entries after setting master password
+        self._load_vault_entries_from_db()
         self.show_screen("dashboard")
 
     def check_login(self):
@@ -179,36 +206,57 @@ class EncryptedPasswordManagerApp: # Renamed class
             messagebox.showerror("Error", "No master password found. Please set one.")
             return
 
-        stored_salt = self.master_password_data['salt']
+        stored_mp_salt = self.master_password_data['salt']
         stored_hashed_password = self.master_password_data['hashed_password']
+        stored_encrypted_vk = self.master_password_data['encrypted_vault_key']
+        stored_vk_iv = self.master_password_data['vk_iv']
 
-        derived_key_for_check = derive_key(entered_password, stored_salt)
+        entered_mp_derived_key = derive_key(entered_password, stored_mp_salt)
 
-        if derived_key_for_check == stored_hashed_password:
-            self.current_master_key = derived_key_for_check
-            messagebox.showinfo("Success", "Login successful!")
-            self._load_vault_entries_from_db() # Load entries after successful login
-            self.show_screen("dashboard")
-            self.entry_password.delete(0, tk.END)
+        if entered_mp_derived_key == stored_hashed_password:
+            try:
+                self.vault_key = decrypt_vault_key(
+                    base64.b64encode(stored_encrypted_vk).decode('utf-8'),
+                    base64.b64encode(stored_vk_iv).decode('utf-8'),
+                    entered_mp_derived_key
+                )
+                self._mp_derived_key_temp = entered_mp_derived_key
+                
+                self._load_vault_entries_from_db()
+                self.show_screen("dashboard")
+                self.entry_password.delete(0, tk.END)
+            except Exception as e:
+                messagebox.showerror("Decryption Error", f"Failed to decrypt vault key. Master Password file might be corrupted. Error: {e}")
+                self.vault_key = None
+                self._mp_derived_key_temp = None
         else:
             messagebox.showerror("Error", "Incorrect Master Password")
+            self.vault_key = None
+            self._mp_derived_key_temp = None
 
     # --- Dashboard Screen ---
     def dashboard_screen(self):
         """Sets up the main dashboard screen."""
         self.dashboard_frame = tk.Frame(self.root)
         tk.Label(self.dashboard_frame, text="Dashboard", font=("Arial", 16, "bold")).pack(pady=20)
-        tk.Button(self.dashboard_frame, text="View/Edit/Delete Entries", width=30, command=lambda: self.show_screen("view_entries"), font=("Arial", 12)).pack(pady=10)
+        
         tk.Button(self.dashboard_frame, text="Add New Entry", width=30, command=lambda: self.show_screen("add_entry"), font=("Arial", 12)).pack(pady=10)
+        
+        tk.Button(self.dashboard_frame, text="Manage Entries", width=30, command=lambda: self.show_screen("view_entries"), font=("Arial", 12)).pack(pady=10)
+        
         tk.Button(self.dashboard_frame, text="Generate Password", width=30, command=lambda: self.show_screen("generate_password"), font=("Arial", 12)).pack(pady=10)
+        
+        tk.Button(self.dashboard_frame, text="Change Master Password", width=30, command=lambda: self.show_screen("change_master_password"), font=("Arial", 12)).pack(pady=10)
+
         tk.Button(self.dashboard_frame, text="Logout", width=30, command=self.logout, font=("Arial", 12)).pack(pady=20)
 
     def logout(self):
-        """Logs out the user, clearing the master key and vault entries from memory."""
-        self.current_master_key = None
+        """Logs out the user, clearing the vault key and vault entries from memory."""
+        self.vault_key = None
+        self._mp_derived_key_temp = None
         self.vault_entries = []
-        self.editing_entry_index = -1 # Reset editing state on logout
-        messagebox.showinfo("Logout", "Logged out successfully.")
+        self.editing_entry_index = -1
+        
         self.show_screen("login")
 
     # --- Add New Entry / Edit Entry Screen ---
@@ -216,7 +264,6 @@ class EncryptedPasswordManagerApp: # Renamed class
         """Sets up the screen for adding new or editing existing password entries."""
         self.add_entry_frame = tk.Frame(self.root)
         
-        # Dynamic Title for Add/Edit
         title_text = "Edit Entry" if self.editing_entry_index != -1 else "Add New Entry"
         tk.Label(self.add_entry_frame, text=title_text, font=("Arial", 16, "bold")).pack(pady=10)
 
@@ -239,23 +286,22 @@ class EncryptedPasswordManagerApp: # Renamed class
 
         tk.Button(self.add_entry_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 10)).pack(pady=10)
 
-        # Pre-populate fields if in edit mode
         if self.editing_entry_index != -1:
             try:
                 entry = self.vault_entries[self.editing_entry_index]
                 self.site_entry.insert(0, entry['site'])
                 self.username_entry.insert(0, entry['username'])
-                # Decrypt and display password for editing
-                decrypted_pass = decrypt(
+                
+                decrypted_pass = decrypt_entry(
                     entry['password_enc']['ciphertext'],
-                    self.current_master_key.decode('latin-1'),
+                    self.vault_key,
                     entry['password_enc']['salt'],
                     entry['password_enc']['iv']
                 )
                 self.password_entry.insert(0, decrypted_pass)
             except Exception as e:
                 messagebox.showerror("Error", f"Could not load entry for editing: {e}")
-                self.editing_entry_index = -1 # Reset if error
+                self.editing_entry_index = -1
 
     def generate_password_for_add(self):
         """Generates a random password and inserts it into the password entry field."""
@@ -266,7 +312,6 @@ class EncryptedPasswordManagerApp: # Renamed class
         self.password_entry.insert(0, new_pass)
 
     def save_entry(self):
-        """Encrypts and saves a new password entry or updates an existing one."""
         site = self.site_entry.get().strip()
         username = self.username_entry.get().strip()
         plaintext_password = self.password_entry.get()
@@ -274,16 +319,16 @@ class EncryptedPasswordManagerApp: # Renamed class
         if not site or not username or not plaintext_password:
             messagebox.showwarning("Warning", "Please fill all fields!")
             return
-        if not self.current_master_key:
-            messagebox.showerror("Error", "Not logged in. Cannot save entry without a master key.")
+        if not self.vault_key:
+            messagebox.showerror("Error", "Not logged in. Cannot save entry without a vault key.")
             return
 
         try:
-            encrypted_data = encrypt(plaintext_password, self.current_master_key.decode('latin-1'))
+            encrypted_data = encrypt_entry(plaintext_password, self.vault_key)
 
             if self.editing_entry_index != -1: # It's an edit operation
                 original_entry = self.vault_entries[self.editing_entry_index]
-                entry_id = original_entry['id'] # Use the database ID for update
+                entry_id = original_entry['id']
 
                 self.cursor.execute('''
                     UPDATE entries
@@ -293,7 +338,6 @@ class EncryptedPasswordManagerApp: # Renamed class
                       encrypted_data['salt'], encrypted_data['iv'], entry_id))
                 self.conn.commit()
 
-                # Update the in-memory list
                 original_entry.update({
                     'site': site,
                     'username': username,
@@ -308,21 +352,21 @@ class EncryptedPasswordManagerApp: # Renamed class
                 ''', (site, username, encrypted_data['ciphertext'], encrypted_data['salt'], encrypted_data['iv']))
                 self.conn.commit()
                 
-                # Retrieve the last inserted ID for the new entry to store in memory
                 new_id = self.cursor.lastrowid
                 self.vault_entries.append({
-                    'id': new_id, # Store database ID
+                    'id': new_id,
                     'site': site,
                     'username': username,
                     'password_enc': encrypted_data
                 })
                 messagebox.showinfo("Saved", f"Entry for '{site}' saved successfully!")
 
-            # Clear input fields and reset editing state
             self.site_entry.delete(0, tk.END)
             self.username_entry.delete(0, tk.END)
             self.password_entry.delete(0, tk.END)
-            self.editing_entry_index = -1 # Reset to add mode
+            self.editing_entry_index = -1
+
+            self.show_screen("view_entries")
 
         except Exception as e:
             messagebox.showerror("Encryption/Database Error", f"Failed to save entry: {e}")
@@ -330,7 +374,6 @@ class EncryptedPasswordManagerApp: # Renamed class
 
     # --- Password Generator Screen ---
     def generate_password_screen(self):
-        """Sets up the standalone password generator screen."""
         self.generate_password_frame = tk.Frame(self.root)
         tk.Label(self.generate_password_frame, text="Generate a Strong Password", font=("Arial", 16, "bold")).pack(pady=20)
         self.generated_pass_entry = tk.Entry(self.generate_password_frame, width=50, font=("Arial", 12))
@@ -340,7 +383,6 @@ class EncryptedPasswordManagerApp: # Renamed class
         tk.Button(self.generate_password_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 12)).pack(pady=20)
 
     def generate_password_only(self):
-        """Generates a random password for the dedicated generator screen."""
         length = 16
         chars = string.ascii_letters + string.digits + string.punctuation
         new_pass = ''.join(random.choices(chars, k=length))
@@ -348,7 +390,6 @@ class EncryptedPasswordManagerApp: # Renamed class
         self.generated_pass_entry.insert(0, new_pass)
 
     def copy_generated_password(self):
-        """Copies the generated password to the clipboard and sets auto-clear."""
         generated_pass = self.generated_pass_entry.get()
         if generated_pass:
             self.root.clipboard_clear()
@@ -360,7 +401,6 @@ class EncryptedPasswordManagerApp: # Renamed class
 
     # --- View/Edit/Delete Entries Screen ---
     def view_entries_screen(self):
-        """Sets up the screen for viewing and managing saved password entries."""
         self.view_entries_frame = tk.Frame(self.root)
         tk.Label(self.view_entries_frame, text="Your Saved Entries", font=("Arial", 16, "bold")).pack(pady=10)
 
@@ -388,27 +428,21 @@ class EncryptedPasswordManagerApp: # Renamed class
         tk.Button(action_buttons_frame, text="Toggle Password Visibility", command=self.toggle_password_visibility, font=("Arial", 10)).pack(side="left", padx=5)
         tk.Button(action_buttons_frame, text="Copy Password", command=self.copy_password, font=("Arial", 10)).pack(side="left", padx=5)
         tk.Button(action_buttons_frame, text="Delete Selected", command=self.delete_selected_entry, font=("Arial", 10)).pack(side="left", padx=5)
-        tk.Button(action_buttons_frame, text="Edit Selected", command=self.edit_selected_entry, font=("Arial", 10)).pack(side="left", padx=5) # NEW EDIT BUTTON
+        tk.Button(action_buttons_frame, text="Edit Selected", command=self.edit_selected_entry, font=("Arial", 10)).pack(side="left", padx=5)
 
         tk.Button(self.view_entries_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 12)).pack(pady=20)
 
         self.current_selected_index = -1
-        self.password_visible_for_index = -1 # Track which password is currently visible
+        self.password_visible_for_index = -1
 
-    # NEW: Edit Selected Entry Method
     def edit_selected_entry(self):
         """Prepares the add_entry_screen for editing the selected entry."""
         if self.current_selected_index == -1:
             messagebox.showwarning("Warning", "Please select an entry to edit.")
             return
 
-        # Set the flag for editing
         self.editing_entry_index = self.current_selected_index
-        
-        # Now switch to the add_entry_screen, which will detect editing_entry_index
-        # and pre-populate fields.
         self.show_screen("add_entry")
-
 
     def update_view_entries_list(self):
         """Clears and repopulates the listbox with current vault entries."""
@@ -438,20 +472,20 @@ class EncryptedPasswordManagerApp: # Renamed class
             return
 
         self.current_selected_index = selected_indices[0]
-        self.password_visible_for_index = -1 # Reset visibility when a new entry is selected
-        self.editing_entry_index = -1 # NEW: Ensure editing state is reset when a new entry is selected in the list
+        self.password_visible_for_index = -1
+        self.editing_entry_index = -1
         self.display_entry_details(self.current_selected_index)
 
     def display_entry_details(self, index):
         """Updates the detail label with information about the selected entry."""
         if 0 <= index < len(self.vault_entries):
             entry = self.vault_entries[index]
-            password_display = "********" # Default hidden
+            password_display = "********"
             if self.password_visible_for_index == index:
                 try:
-                    decrypted_pass = decrypt(
+                    decrypted_pass = decrypt_entry(
                         entry['password_enc']['ciphertext'],
-                        self.current_master_key.decode('latin-1'),
+                        self.vault_key,
                         entry['password_enc']['salt'],
                         entry['password_enc']['iv']
                     )
@@ -474,16 +508,16 @@ class EncryptedPasswordManagerApp: # Renamed class
             messagebox.showwarning("Warning", "Please select an entry first.")
             return
 
-        if not self.current_master_key:
+        if not self.vault_key:
             messagebox.showerror("Error", "Not logged in. Cannot decrypt password.")
             return
 
         if self.password_visible_for_index == self.current_selected_index:
-            self.password_visible_for_index = -1 # Hide it
+            self.password_visible_for_index = -1
         else:
-            self.password_visible_for_index = self.current_selected_index # Show it
+            self.password_visible_for_index = self.current_selected_index
 
-        self.display_entry_details(self.current_selected_index) # Refresh display to show change
+        self.display_entry_details(self.current_selected_index)
 
     def copy_password(self):
         """Copies the decrypted password of the selected entry to the clipboard."""
@@ -491,15 +525,15 @@ class EncryptedPasswordManagerApp: # Renamed class
             messagebox.showwarning("Warning", "Please select an entry first.")
             return
 
-        if not self.current_master_key:
+        if not self.vault_key:
             messagebox.showerror("Error", "Not logged in. Cannot copy password.")
             return
 
         try:
             entry = self.vault_entries[self.current_selected_index]
-            decrypted_pass = decrypt(
+            decrypted_pass = decrypt_entry(
                 entry['password_enc']['ciphertext'],
-                self.current_master_key.decode('latin-1'),
+                self.vault_key,
                 entry['password_enc']['salt'],
                 entry['password_enc']['iv']
             )
@@ -518,14 +552,12 @@ class EncryptedPasswordManagerApp: # Renamed class
 
         if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this entry?"):
             entry_to_delete = self.vault_entries[self.current_selected_index]
-            # Use the database ID for deletion for robustness
             entry_id_to_delete = entry_to_delete['id']
 
             try:
                 self.cursor.execute('DELETE FROM entries WHERE id = ?', (entry_id_to_delete,))
                 self.conn.commit()
 
-                # Remove from in-memory list using the index
                 del self.vault_entries[self.current_selected_index]
                 messagebox.showinfo("Deleted", "Entry deleted successfully.")
                 self.update_view_entries_list()
@@ -536,9 +568,102 @@ class EncryptedPasswordManagerApp: # Renamed class
                 messagebox.showerror("Database Error", f"Failed to delete entry from database: {e}")
                 self.conn.rollback()
 
+    # --- Change Master Password Screen and Logic (Now safe for data!) ---
+    def change_master_password_screen(self):
+        self.change_master_password_frame = tk.Frame(self.root)
+        tk.Label(self.change_master_password_frame, text="Change Master Password", font=("Arial", 16, "bold")).pack(pady=20)
+
+        tk.Label(self.change_master_password_frame, text="Current Master Password:", font=("Arial", 10)).pack(anchor="w", padx=10, pady=(5,0))
+        self.current_master_pass_entry = tk.Entry(self.change_master_password_frame, show="*", width=40, font=("Arial", 10))
+        self.current_master_pass_entry.pack(pady=5)
+
+        tk.Label(self.change_master_password_frame, text="New Master Password:", font=("Arial", 10)).pack(anchor="w", padx=10, pady=(5,0))
+        self.new_master_pass_entry = tk.Entry(self.change_master_password_frame, show="*", width=40, font=("Arial", 10))
+        self.new_master_pass_entry.pack(pady=5)
+
+        tk.Label(self.change_master_password_frame, text="Confirm New Master Password:", font=("Arial", 10)).pack(anchor="w", padx=10, pady=(5,0))
+        self.confirm_new_master_pass_entry = tk.Entry(self.change_master_password_frame, show="*", width=40, font=("Arial", 10))
+        self.confirm_new_master_pass_entry.pack(pady=5)
+
+        tk.Button(self.change_master_password_frame, text="Change Password", command=self.perform_change_master_password, font=("Arial", 12)).pack(pady=15)
+        tk.Button(self.change_master_password_frame, text="Back to Dashboard", command=lambda: self.show_screen("dashboard"), font=("Arial", 12)).pack(pady=10)
+
+    def perform_change_master_password(self):
+        current_pass = self.current_master_pass_entry.get()
+        new_pass = self.new_master_pass_entry.get()
+        confirm_new_pass = self.confirm_new_master_pass_entry.get()
+
+        if not current_pass or not new_pass or not confirm_new_pass:
+            messagebox.showwarning("Warning", "All fields must be filled.")
+            return
+
+        if not self.master_password_data:
+            messagebox.showerror("Error", "No master password set. Cannot change.")
+            self.show_screen("login")
+            return
+        
+        # Verify current master password (MPDK)
+        stored_mp_salt = self.master_password_data['salt']
+        stored_hashed_password = self.master_password_data['hashed_password']
+        entered_mp_derived_key = derive_key(current_pass, stored_mp_salt)
+
+        if entered_mp_derived_key != stored_hashed_password:
+            messagebox.showerror("Error", "Incorrect Current Master Password.")
+            return
+
+        # Validate new master password
+        if new_pass != confirm_new_pass:
+            messagebox.showwarning("Warning", "New passwords do not match.")
+            return
+        if new_pass == current_pass:
+            messagebox.showwarning("Warning", "New password cannot be the same as the current password.")
+            return
+        if len(new_pass) < 8:
+            messagebox.showwarning("Warning", "New password should be at least 8 characters long.")
+            return
+
+        try:
+            # Step 1: Decrypt the existing Vault Key (VK) using the old MPDK
+            stored_encrypted_vk = self.master_password_data['encrypted_vault_key']
+            stored_vk_iv = self.master_password_data['vk_iv']
+            
+            current_vault_key = decrypt_vault_key(
+                base64.b64encode(stored_encrypted_vk).decode('utf-8'),
+                base64.b64encode(stored_vk_iv).decode('utf-8'),
+                entered_mp_derived_key # Use the verified old MPDK to decrypt VK
+            )
+
+            # Step 2: Derive a NEW Master Password Derived Key (New MPDK) from the new password
+            new_mp_salt = os.urandom(16)
+            new_mp_derived_key = derive_key(new_pass, new_mp_salt)
+
+            # Step 3: Encrypt the SAME Vault Key (VK) with the New MPDK
+            new_encrypted_vk_data = encrypt_vault_key(current_vault_key, new_mp_derived_key)
+
+            # Step 4: Save the new Master Password hash, new salt, and the newly encrypted Vault Key
+            self._save_master_password_data(
+                hashed_password_bytes=new_mp_derived_key,
+                salt_bytes=new_mp_salt,
+                encrypted_vk_bytes=base64.b64decode(new_encrypted_vk_data['ciphertext']),
+                vk_iv_bytes=base64.b64decode(new_encrypted_vk_data['iv'])
+            )
+            
+            self.vault_key = current_vault_key
+            self._mp_derived_key_temp = new_mp_derived_key
+
+            messagebox.showinfo("Success", "Master Password changed successfully! Your vault entries are secure.")
+            
+            self.current_master_pass_entry.delete(0, tk.END)
+            self.new_master_pass_entry.delete(0, tk.END)
+            self.confirm_new_master_pass_entry.delete(0, tk.END)
+            self.show_screen("dashboard")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred while changing master password: {e}\nYour master password may not have been changed.")
+
 
 # Run the application
 if __name__ == "__main__":
     root = tk.Tk()
-    app = EncryptedPasswordManagerApp(root) 
+    app = EncryptedPasswordManagerApp(root)
     root.mainloop()
