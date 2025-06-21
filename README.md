@@ -111,6 +111,7 @@ CREATE TABLE entries (
 - **`vault.db`**: SQLite database containing encrypted password entries
 - **`master_pass.json`**: Stores master password hash, salt, and encrypted vault key
 
+
 ## 🛡️ Security Considerations
 
 - **Never share your master password**
